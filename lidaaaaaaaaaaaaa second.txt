@@ -1,0 +1,405 @@
+import numpy as np
+import pandas as pd
+import laspy
+from sklearn.neighbors import NearestNeighbors
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.preprocessing import LabelEncoder
+from xgboost import XGBClassifier
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+
+# ══════════════════════════════════════════════════════════════
+# ✅ FILE PATHS
+# ══════════════════════════════════════════════════════════════
+REFERENCE_LAZ = r"D:\veera\VK.laz"
+TARGET_LAZ    = r"C:\Users\user\Downloads\LiDAR-PointClouds-Classification-master\data\DX3035724 S.GIUSTO000001.laz"
+OUTPUT_LAZ    = r"C:\Users\user\Downloads\LiDAR-PointClouds-Classification-master\data\OUTPUT_CLASSIFIED.laz"
+
+# ══════════════════════════════════════════════════════════════
+# ✅ SETTINGS
+# ══════════════════════════════════════════════════════════════
+GRID_RES     = 0.5
+TRAIN_POINTS = 500000
+CHUNK_SIZE   = 300000
+K_NEIGHBORS  = 20
+
+# ══════════════════════════════════════════════════════════════
+# ✅ VALID CLASSES FROM REFERENCE
+# ══════════════════════════════════════════════════════════════
+VALID_CLASSES = [2, 3, 4, 5, 6, 9, 14, 17]
+
+# ══════════════════════════════════════════════════════════════
+# ✅ EXACT COLORS — AS YOU WANTED
+# Class 3 Low Vegetation = Gray
+# Class 6 Building       = Orange
+# Class 9 Water          = Blue
+# ══════════════════════════════════════════════════════════════
+CLASS_INFO = {
+    2:  {"name": "Ground",            "rgb": (139,  90,  43)},  # 🟤 Dark Brown
+    3:  {"name": "Low Vegetation",    "rgb": (128, 128, 128)},  # ⬛ Gray
+    4:  {"name": "Medium Vegetation", "rgb": ( 34, 139,  34)},  # 🟢 Medium Green
+    5:  {"name": "High Vegetation",   "rgb": (  0, 100,   0)},  # 🟢 Dark Green
+    6:  {"name": "Building",          "rgb": (255, 140,   0)},  # 🟠 Orange
+    9:  {"name": "Water",             "rgb": ( 30, 144, 255)},  # 🔵 Blue
+    14: {"name": "Powerline Cable",   "rgb": (255, 255,   0)},  # 🟡 Yellow
+    15: {"name": "Powerline Tower",   "rgb": (128,   0, 128)},  # 🟣 Purple
+    17: {"name": "Bridge",            "rgb": (  0, 255, 255)},  # 🩵 Cyan
+}
+
+FEAT_NAMES = ['Linearity','Planarity','Sphericity','Omnivar','Anisotropy',
+              'Eigentropy','Curvature','Verticality','HeightVar','HeightIQR',
+              'MeanDist','MaxDist','Density','Height','HAG',
+              'Intensity','LocalSTD','LocalRange','LocalMean']
+
+# ══════════════════════════════════════════════════════════════
+# HELPER: Height Above Ground
+# ══════════════════════════════════════════════════════════════
+def compute_hag(x, y, z):
+    print("      → Computing Height Above Ground...")
+    x_idx = ((x - x.min()) / GRID_RES).astype(int)
+    y_idx = ((y - y.min()) / GRID_RES).astype(int)
+    gkey  = x_idx * 100000 + y_idx
+    df          = pd.DataFrame({'z': z, 'key': gkey})
+    gmin        = df.groupby('key')['z'].min()
+    gstd        = df.groupby('key')['z'].std().fillna(0)
+    gmax        = df.groupby('key')['z'].max()
+    gmean       = df.groupby('key')['z'].mean()
+    df['zg']    = df['key'].map(gmin)
+    df['zs']    = df['key'].map(gstd)
+    df['zmax']  = df['key'].map(gmax)
+    df['zmean'] = df['key'].map(gmean)
+    hag    = np.array(df['z']    - df['zg'])
+    lstd   = np.array(df['zs'])
+    lrange = np.array(df['zmax'] - df['zg'])
+    lmean  = np.array(df['zmean'])
+    print("      → Done!")
+    return hag, lstd, lrange, lmean
+
+# ══════════════════════════════════════════════════════════════
+# HELPER: 19 Geometric Features
+# ══════════════════════════════════════════════════════════════
+def compute_features(x, y, z, intensity, hag, lstd, lrange, lmean):
+    coords    = np.column_stack([x, y, z])
+    nbrs      = NearestNeighbors(n_neighbors=K_NEIGHBORS, algorithm='kd_tree', n_jobs=-1).fit(coords)
+    dist, idx = nbrs.kneighbors(coords)
+    feats = []
+    for i in range(len(coords)):
+        nb  = coords[idx[i]]
+        cov = np.cov((nb - nb.mean(axis=0)).T)
+        ev  = np.sort(np.abs(np.linalg.eigvalsh(cov)))[::-1] + 1e-10
+        e1, e2, e3 = ev
+        feats.append([
+            (e1-e2)/e1,
+            (e2-e3)/e1,
+            e3/e1,
+            (e1*e2*e3)**(1/3),
+            (e1-e3)/e1,
+            -(e1*np.log(e1)+e2*np.log(e2)+e3*np.log(e3)),
+            e3/(e1+e2+e3),
+            1-(e3/e1),
+            np.var(nb[:,2]),
+            np.percentile(nb[:,2],75)-np.percentile(nb[:,2],25),
+            dist[i].mean(),
+            dist[i].max(),
+            K_NEIGHBORS/(dist[i].mean()**2+1e-10),
+            z[i],
+            hag[i],
+            intensity[i],
+            lstd[i],
+            lrange[i],
+            lmean[i],
+        ])
+    return np.array(feats)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 1: Load REFERENCE file (VK.laz)
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 1: Loading REFERENCE file (VK.laz)...")
+print("="*60)
+ref = laspy.read(REFERENCE_LAZ)
+rx  = np.array(ref.x)
+ry  = np.array(ref.y)
+rz  = np.array(ref.z)
+rl  = np.array(ref.classification)
+try:
+    ri = np.array(ref.intensity, dtype=float)
+    ri = (ri - ri.min()) / (ri.max() - ri.min() + 1e-10)
+except:
+    ri = np.zeros(len(rx))
+print(f"✅ Loaded: {len(rx):,} points")
+vmask = np.isin(rl, VALID_CLASSES)
+rx, ry, rz, ri, rl = rx[vmask], ry[vmask], rz[vmask], ri[vmask], rl[vmask]
+print(f"✅ Valid points: {len(rx):,}")
+for c in np.unique(rl):
+    count = np.sum(rl == c)
+    name  = CLASS_INFO.get(int(c), {}).get("name", str(c))
+    print(f"   Class {c:>2} | {name:<22} | {count:>9,} ({100*count/len(rl):.1f}%)")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 2: Compute HAG for reference
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 2: Computing HAG for reference...")
+print("="*60)
+rhag, rstd, rrange, rmean = compute_hag(rx, ry, rz)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 3: Stratified subsample + features
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 3: Computing training features (3-5 mins)...")
+print("="*60)
+unique_cls = np.unique(rl)
+idx_list   = []
+per_class  = TRAIN_POINTS // len(unique_cls)
+for cls_id in unique_cls:
+    cls_idx = np.where(rl == cls_id)[0]
+    n       = min(len(cls_idx), max(1000, per_class))
+    idx_list.append(np.random.choice(cls_idx, n, replace=False))
+train_idx = np.concatenate(idx_list)
+np.random.shuffle(train_idx)
+print(f"✅ Training with {len(train_idx):,} points")
+
+total  = len(train_idx)
+chunks = []
+for start in range(0, total, 5000):
+    end = min(start + 5000, total)
+    if start % 25000 == 0:
+        print(f"   {start:,} / {total:,} done...")
+    sl = slice(start, end)
+    chunks.append(compute_features(
+        rx[train_idx[sl]], ry[train_idx[sl]], rz[train_idx[sl]],
+        ri[train_idx[sl]],
+        rhag[train_idx[sl]], rstd[train_idx[sl]],
+        rrange[train_idx[sl]], rmean[train_idx[sl]]
+    ))
+X_all     = np.vstack(chunks)
+y_all     = rl[train_idx]
+le        = LabelEncoder()
+y_encoded = le.fit_transform(y_all)
+print(f"✅ Feature matrix: {X_all.shape}")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 4: Train XGBoost
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 4: Training XGBoost model...")
+print("="*60)
+X_train, X_test, y_train, y_test = train_test_split(
+    X_all, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded)
+clf = XGBClassifier(
+    n_estimators=500, max_depth=8, learning_rate=0.1,
+    subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
+    gamma=0.1, n_jobs=-1, random_state=42,
+    tree_method='hist', eval_metric='mlogloss', verbosity=0
+)
+clf.fit(X_train, y_train)
+print("✅ XGBoost trained!")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 5: Accuracy Report
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("📊 ACCURACY REPORT — ALL CLASSES")
+print("="*60)
+y_pred      = clf.predict(X_test)
+overall_acc = accuracy_score(y_test, y_pred) * 100
+cv_scores   = cross_val_score(clf, X_all, y_encoded, cv=5, scoring='accuracy', n_jobs=-1)
+print(f"\n🎯 Overall Accuracy  : {overall_acc:.1f}%")
+print(f"🎯 Cross-Val Accuracy: {cv_scores.mean()*100:.1f}% (±{cv_scores.std()*100:.1f}%)")
+report      = classification_report(y_test, y_pred, output_dict=True)
+present_cls = np.unique(y_test)
+print(f"\n{'─'*65}")
+print(f"{'Cls':>4} {'Name':<22} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Acc':>8}")
+print(f"{'─'*65}")
+for cls_enc in present_cls:
+    cls_id = int(le.inverse_transform([cls_enc])[0])
+    name   = CLASS_INFO.get(cls_id, {}).get("name", f"Class {cls_id}")
+    key    = str(cls_enc)
+    mask   = y_test == cls_enc
+    acc    = accuracy_score(y_test[mask], y_pred[mask]) * 100
+    if key in report:
+        prec = report[key]['precision'] * 100
+        rec  = report[key]['recall']    * 100
+        f1   = report[key]['f1-score']  * 100
+    else:
+        prec = rec = f1 = 0.0
+    bar = "█" * int(acc/5) + "░" * (20-int(acc/5))
+    print(f"  {cls_id:>3} {name:<22} {prec:>9.1f}% {rec:>7.1f}% {f1:>7.1f}% {acc:>7.1f}%")
+    print(f"       [{bar}] {acc:.1f}%")
+print(f"{'─'*65}")
+print(f"  {'OVERALL':<26} {'':>10} {'':>8} {'':>8} {overall_acc:>7.1f}%")
+print(f"{'─'*65}")
+
+# Save confusion matrix
+fig, ax = plt.subplots(figsize=(10, 8))
+labels  = [CLASS_INFO.get(int(le.inverse_transform([c])[0]),{}).get("name", str(c)) for c in present_cls]
+cm      = confusion_matrix(y_test, y_pred, labels=present_cls)
+disp    = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+disp.plot(ax=ax, colorbar=True, xticks_rotation=45, cmap='Blues')
+ax.set_title(f"Confusion Matrix — Accuracy: {overall_acc:.1f}%", fontsize=13, fontweight='bold')
+plt.tight_layout()
+plt.savefig(r"C:\Users\user\Downloads\LiDAR-PointClouds-Classification-master\confusion_matrix.png", dpi=150, bbox_inches='tight')
+plt.close()
+print(f"\n✅ Saved: confusion_matrix.png")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 6: Load TARGET file
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 6: Loading TARGET (input) file...")
+print("="*60)
+tgt = laspy.read(TARGET_LAZ)
+tx  = np.array(tgt.x)
+ty  = np.array(tgt.y)
+tz  = np.array(tgt.z)
+try:
+    ti = np.array(tgt.intensity, dtype=float)
+    ti = (ti - ti.min()) / (ti.max() - ti.min() + 1e-10)
+except:
+    ti = np.zeros(len(tx))
+print(f"✅ Loaded: {len(tx):,} points")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 7: Compute HAG for target
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 7: Computing HAG for target...")
+print("="*60)
+thag, tstd, trange, tmean = compute_hag(tx, ty, tz)
+tz_range = tz.max() - tz.min()
+print("✅ Done!")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 8: Classify target in chunks
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 8: Classifying target file...")
+print("="*60)
+all_labels = np.zeros(len(tx), dtype=np.uint8)
+total      = len(tx)
+for start in range(0, total, CHUNK_SIZE):
+    end = min(start + CHUNK_SIZE, total)
+    print(f"   Chunk {start:,} → {end:,} of {total:,}...")
+    sl             = slice(start, end)
+    X_chunk        = compute_features(
+                        tx[sl], ty[sl], tz[sl], ti[sl],
+                        thag[sl], tstd[sl], trange[sl], tmean[sl])
+    pred_enc       = clf.predict(X_chunk)
+    all_labels[sl] = le.inverse_transform(pred_enc).astype(np.uint8)
+print("✅ Classification done!")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 9: Force detect Building + Tower + Cable
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 9: Force detecting Buildings + Towers + Cables...")
+print("="*60)
+
+building_mask = (
+    (thag > 3.0) &
+    (thag < tz_range * 0.65) &
+    (tstd < 1.2) &
+    (trange > 2.0) &
+    (~np.isin(all_labels, [9, 14])) &
+    (np.isin(all_labels, [2, 3, 4]))
+)
+all_labels[building_mask] = 6
+print(f"✅ Buildings detected    : {np.sum(building_mask):,} points")
+
+tower_mask = (
+    (thag > tz_range * 0.4) &
+    (tstd > 2.5) &
+    (~np.isin(all_labels, [6, 9]))
+)
+all_labels[tower_mask] = 15
+print(f"✅ Powerline Towers      : {np.sum(tower_mask):,} points")
+
+cable_mask = (
+    (thag > tz_range * 0.3) &
+    (thag < tz_range * 0.7) &
+    (tstd > 1.0) &
+    (tstd < 2.5) &
+    (~np.isin(all_labels, [6, 9, 15]))
+)
+all_labels[cable_mask] = 14
+print(f"✅ Powerline Cables      : {np.sum(cable_mask):,} points")
+
+print(f"\n📊 Final Results ({total:,} total points):")
+print(f"{'Class':>6} {'Name':<22} {'Count':>12} {'%':>7}")
+print("─" * 52)
+for cls_id in sorted(CLASS_INFO.keys()):
+    count = int(np.sum(all_labels == cls_id))
+    if count == 0:
+        continue
+    pct  = 100 * count / total
+    name = CLASS_INFO[cls_id]["name"]
+    print(f"  {cls_id:>5} {name:<22} {count:>12,} {pct:>6.1f}%")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 10: Write RGB Colors + Save LAZ
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 10: Writing colors and saving LAZ...")
+print("="*60)
+
+red   = np.zeros(len(tx), dtype=np.uint16)
+green = np.zeros(len(tx), dtype=np.uint16)
+blue  = np.zeros(len(tx), dtype=np.uint16)
+
+for cls_id, info in CLASS_INFO.items():
+    mask = all_labels == cls_id
+    if np.any(mask):
+        r, g, b     = info["rgb"]
+        red[mask]   = r * 256
+        green[mask] = g * 256
+        blue[mask]  = b * 256
+        print(f"   ✅ Class {cls_id:>2} {info['name']:<22} → RGB({r:>3},{g:>3},{b:>3}) → {np.sum(mask):>10,} pts")
+
+header         = laspy.LasHeader(point_format=2, version="1.2")
+header.offsets = tgt.header.offsets
+header.scales  = tgt.header.scales
+new_las                = laspy.LasData(header=header)
+new_las.x              = tgt.x
+new_las.y              = tgt.y
+new_las.z              = tgt.z
+new_las.classification = all_labels
+new_las.red            = red
+new_las.green          = green
+new_las.blue           = blue
+try:
+    new_las.intensity = tgt.intensity
+except:
+    pass
+new_las.write(OUTPUT_LAZ)
+
+print(f"""
+╔══════════════════════════════════════════════════════════╗
+║              ✅ OUTPUT FILE SAVED!                       ║
+╠══════════════════════════════════════════════════════════╣
+║  📁 OUTPUT_CLASSIFIED.laz                                ║
+║  📊 Accuracy : {overall_acc:.1f}%                                ║
+╠══════════════════════════════════════════════════════════╣
+║  FINAL COLORS:                                           ║
+║  Class  2  🌍 Ground          = 🟤 Dark Brown           ║
+║  Class  3  🌱 Low Vegetation  = ⬛ Gray                 ║
+║  Class  4  🌿 Med Vegetation  = 🟢 Medium Green         ║
+║  Class  5  🌳 High Vegetation = 🟢 Dark Green           ║
+║  Class  6  🏠 Building        = 🟠 Orange               ║
+║  Class  9  💧 Water           = 🔵 Blue                 ║
+║  Class 14  ⚡ Powerline Cable = 🟡 Yellow               ║
+║  Class 15  🗼 Powerline Tower = 🟣 Purple               ║
+║  Class 17  🌉 Bridge          = 🩵 Cyan                 ║
+╠══════════════════════════════════════════════════════════╣
+║  📂 Open in CloudCompare:                               ║
+║  1. File → Open → OUTPUT_CLASSIFIED.laz                 ║
+║  2. Left panel → click point cloud                      ║
+║  3. Properties → Colors → RGB                           ║
+╚══════════════════════════════════════════════════════════╝
+""")
+print("✅ DONE!")

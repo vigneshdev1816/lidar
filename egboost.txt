@@ -1,0 +1,666 @@
+import numpy as np
+import pandas as pd
+import laspy
+from sklearn.neighbors import NearestNeighbors
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay, cohen_kappa_score
+from sklearn.preprocessing import LabelEncoder
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+import warnings
+warnings.filterwarnings('ignore')
+
+# ══════════════════════════════════════════════════════════════
+# ✅ FILE PATHS — CHANGE THESE TO YOUR PATHS
+# ══════════════════════════════════════════════════════════════
+REFERENCE_LAZ = r"D:\veera\VK.laz"                         # ← classified reference file
+TARGET_LAZ    = r"D:\veera\DX3035724 S.GIUSTO000001.laz"                      # ← unclassified input file
+OUTPUT_LAZ    = r"D:\veera\OUTPUT_33333CLASSIFIED.laz"            # ← output saved here
+REPORT_DIR    = r"D:\veera"                                  # ← folder for all charts/reports
+
+# ══════════════════════════════════════════════════════════════
+# ✅ SETTINGS
+# ══════════════════════════════════════════════════════════════
+GRID_RES     = 0.5
+TRAIN_POINTS = 500000
+CHUNK_SIZE   = 300000
+K_NEIGHBORS  = 20
+
+# ══════════════════════════════════════════════════════════════
+# ✅ YOUR CUSTOM CLASS SYSTEM — 13 CLASSES — ALL SEPARATE COLORS
+# ══════════════════════════════════════════════════════════════
+VALID_CLASSES = [0, 1, 2, 3, 4, 5, 12, 14, 16, 17, 19, 21, 22]
+
+CLASS_INFO = {
+    0:  {"name": "Default/Unclassified", "rgb": (50,  50,  50)},   # ⬛ Dark Gray
+    1:  {"name": "Ground",               "rgb": (139, 90,  43)},   # 🟤 Brown
+    2:  {"name": "Low Vegetation",       "rgb": (144, 238, 144)},  # 🟩 Light Green
+    3:  {"name": "Medium Vegetation",    "rgb": (34,  139, 34)},   # 🟢 Medium Green
+    4:  {"name": "High Vegetation",      "rgb": (0,   100, 0)},    # 🌲 Dark Green
+    5:  {"name": "Buildings",            "rgb": (255, 140, 0)},    # 🟠 Orange
+    12: {"name": "Street",               "rgb": (169, 169, 169)},  # 🩶 Silver Gray
+    14: {"name": "Bare Conductor",       "rgb": (255, 0,   0)},    # 🔴 Red
+    16: {"name": "Pylons/Poles",         "rgb": (255, 255, 0)},    # 🟡 Yellow
+    17: {"name": "Other Poles",          "rgb": (128, 0,   128)},  # 🟣 Purple
+    19: {"name": "HV Overhead Lines",    "rgb": (0,   0,   255)},  # 🔵 Blue
+    21: {"name": "LV Overhead Lines",    "rgb": (0,   255, 255)},  # 🩵 Cyan
+    22: {"name": "Other Lines",          "rgb": (255, 20,  147)},  # 🩷 Deep Pink
+}
+
+FEAT_NAMES = ['Linearity','Planarity','Sphericity','Omnivar','Anisotropy',
+              'Eigentropy','Curvature','Verticality','HeightVar','HeightIQR',
+              'MeanDist','MaxDist','Density','Height','HAG',
+              'Intensity','LocalSTD','LocalRange','LocalMean']
+
+# ══════════════════════════════════════════════════════════════
+# HELPER: Height Above Ground
+# ══════════════════════════════════════════════════════════════
+def compute_hag(x, y, z):
+    print("      → Computing Height Above Ground...")
+    x_idx = ((x - x.min()) / GRID_RES).astype(int)
+    y_idx = ((y - y.min()) / GRID_RES).astype(int)
+    gkey  = x_idx * 100000 + y_idx
+    df          = pd.DataFrame({'z': z, 'key': gkey})
+    gmin        = df.groupby('key')['z'].min()
+    gstd        = df.groupby('key')['z'].std().fillna(0)
+    gmax        = df.groupby('key')['z'].max()
+    gmean       = df.groupby('key')['z'].mean()
+    df['zg']    = df['key'].map(gmin)
+    df['zs']    = df['key'].map(gstd)
+    df['zmax']  = df['key'].map(gmax)
+    df['zmean'] = df['key'].map(gmean)
+    hag    = np.array(df['z']    - df['zg'])
+    lstd   = np.array(df['zs'])
+    lrange = np.array(df['zmax'] - df['zg'])
+    lmean  = np.array(df['zmean'])
+    print("      → HAG Done!")
+    return hag, lstd, lrange, lmean
+
+# ══════════════════════════════════════════════════════════════
+# HELPER: 19 Geometric Features
+# ══════════════════════════════════════════════════════════════
+def compute_features(x, y, z, intensity, hag, lstd, lrange, lmean):
+    coords    = np.column_stack([x, y, z])
+    nbrs      = NearestNeighbors(n_neighbors=K_NEIGHBORS, algorithm='kd_tree', n_jobs=-1).fit(coords)
+    dist, idx = nbrs.kneighbors(coords)
+    feats = []
+    for i in range(len(coords)):
+        nb  = coords[idx[i]]
+        cov = np.cov((nb - nb.mean(axis=0)).T)
+        ev  = np.sort(np.abs(np.linalg.eigvalsh(cov)))[::-1] + 1e-10
+        e1, e2, e3 = ev
+        feats.append([
+            (e1-e2)/e1,
+            (e2-e3)/e1,
+            e3/e1,
+            (e1*e2*e3)**(1/3),
+            (e1-e3)/e1,
+            -(e1*np.log(e1)+e2*np.log(e2)+e3*np.log(e3)),
+            e3/(e1+e2+e3),
+            1-(e3/e1),
+            np.var(nb[:,2]),
+            np.percentile(nb[:,2],75)-np.percentile(nb[:,2],25),
+            dist[i].mean(),
+            dist[i].max(),
+            K_NEIGHBORS/(dist[i].mean()**2+1e-10),
+            z[i],
+            hag[i],
+            intensity[i],
+            lstd[i],
+            lrange[i],
+            lmean[i],
+        ])
+    return np.array(feats)
+
+# ══════════════════════════════════════════════════════════════
+# HELPER: Print Accuracy Report
+# ══════════════════════════════════════════════════════════════
+def print_accuracy_report(y_true, y_pred, le, title="ACCURACY REPORT"):
+    overall_acc = accuracy_score(y_true, y_pred) * 100
+    kappa       = cohen_kappa_score(y_true, y_pred)
+    report      = classification_report(y_true, y_pred, output_dict=True)
+    present_cls = np.unique(y_true)
+
+    print(f"\n{'═'*72}")
+    print(f"  {title}")
+    print(f"{'═'*72}")
+    print(f"  🎯 Overall Accuracy : {overall_acc:.2f}%")
+    print(f"  🎯 Kappa Score      : {kappa:.4f}  ", end="")
+    if   kappa > 0.80: print("(Excellent ✅)")
+    elif kappa > 0.60: print("(Good ✅)")
+    elif kappa > 0.40: print("(Moderate ⚠️)")
+    else:              print("(Needs Improvement ❌)")
+
+    print(f"\n{'─'*72}")
+    print(f"  {'Cls':>4} {'Name':<25} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Acc':>8}")
+    print(f"{'─'*72}")
+
+    per_class_acc = {}
+    for cls_enc in present_cls:
+        cls_id = int(le.inverse_transform([cls_enc])[0])
+        name   = CLASS_INFO.get(cls_id, {}).get("name", f"Class {cls_id}")
+        key    = str(cls_enc)
+        mask   = y_true == cls_enc
+        acc    = accuracy_score(y_true[mask], y_pred[mask]) * 100
+        per_class_acc[name] = acc
+        if key in report:
+            prec = report[key]['precision'] * 100
+            rec  = report[key]['recall']    * 100
+            f1   = report[key]['f1-score']  * 100
+        else:
+            prec = rec = f1 = 0.0
+        status = "✅" if acc >= 90 else "⚠️ " if acc >= 70 else "❌"
+        bar    = "█" * int(acc/5) + "░" * (20-int(acc/5))
+        print(f"  {cls_id:>3} {name:<25} {prec:>9.1f}% {rec:>7.1f}% {f1:>7.1f}% {acc:>7.1f}% {status}")
+        print(f"       [{bar}] {acc:.1f}%")
+
+    print(f"{'─'*72}")
+    print(f"  {'🏆 OVERALL ACCURACY':<30} {'':>10} {'':>8} {'':>8} {overall_acc:>7.2f}%")
+    print(f"  {'🎯 KAPPA SCORE':<30} {'':>10} {'':>8} {'':>8} {kappa:>7.4f}")
+    print(f"{'═'*72}")
+    return overall_acc, kappa, per_class_acc
+
+# ══════════════════════════════════════════════════════════════
+# HELPER: Save Accuracy Bar Chart
+# ══════════════════════════════════════════════════════════════
+def save_accuracy_chart(per_class_acc, overall_acc, kappa, filename, title):
+    fig, ax = plt.subplots(figsize=(14, 7))
+    names  = list(per_class_acc.keys())
+    accs   = list(per_class_acc.values())
+    colors = ['#22c55e' if a >= 90 else '#f97316' if a >= 70 else '#ef4444' for a in accs]
+
+    bars = ax.bar(names, accs, color=colors, edgecolor='black', linewidth=0.5, width=0.6)
+
+    for bar, acc in zip(bars, accs):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                f'{acc:.1f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    ax.axhline(y=overall_acc, color='red', linestyle='--', linewidth=2,
+               label=f'Overall Accuracy: {overall_acc:.2f}%')
+    ax.set_ylim(0, 115)
+    ax.set_xlabel("Class", fontsize=12)
+    ax.set_ylabel("Accuracy (%)", fontsize=12)
+    ax.set_title(f"{title}\nOverall: {overall_acc:.2f}%  |  Kappa: {kappa:.4f}", fontsize=13, fontweight='bold')
+    ax.tick_params(axis='x', rotation=35)
+
+    legend_elements = [
+        Patch(facecolor='#22c55e', label='≥ 90% Excellent ✅'),
+        Patch(facecolor='#f97316', label='70–90% Good ⚠️'),
+        Patch(facecolor='#ef4444', label='< 70% Needs Improvement ❌'),
+        plt.Line2D([0],[0], color='red', linestyle='--', label=f'Overall: {overall_acc:.2f}%'),
+    ]
+    ax.legend(handles=legend_elements, fontsize=9, loc='upper right')
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Saved: {filename}")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 1: Load REFERENCE file
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 1: Loading REFERENCE file (VK.laz)...")
+print("="*60)
+
+ref = laspy.read(REFERENCE_LAZ)
+rx  = np.array(ref.x)
+ry  = np.array(ref.y)
+rz  = np.array(ref.z)
+rl  = np.array(ref.classification)
+
+try:
+    ri = np.array(ref.intensity, dtype=float)
+    ri = (ri - ri.min()) / (ri.max() - ri.min() + 1e-10)
+except:
+    ri = np.zeros(len(rx))
+
+print(f"✅ Loaded: {len(rx):,} points")
+print(f"📋 Class IDs in VK.laz: {np.unique(rl).tolist()}")
+
+vmask = np.isin(rl, VALID_CLASSES)
+rx, ry, rz, ri, rl = rx[vmask], ry[vmask], rz[vmask], ri[vmask], rl[vmask]
+print(f"✅ Valid points: {len(rx):,}")
+
+print(f"\n{'─'*58}")
+print(f"  {'Class':>6} {'Name':<25} {'Count':>10} {'%':>7}")
+print(f"{'─'*58}")
+for c in np.unique(rl):
+    count = np.sum(rl == c)
+    name  = CLASS_INFO.get(int(c), {}).get("name", f"Unknown-{c}")
+    print(f"  {int(c):>6} {name:<25} {count:>10,} {100*count/len(rl):>6.1f}%")
+print(f"{'─'*58}")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 2: Compute HAG for Reference
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 2: Computing HAG for reference...")
+print("="*60)
+rhag, rstd, rrange, rmean = compute_hag(rx, ry, rz)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 3: Stratified Subsample + Feature Extraction
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 3: Computing training features (3-5 mins)...")
+print("="*60)
+
+unique_cls = np.unique(rl)
+idx_list   = []
+per_class  = TRAIN_POINTS // len(unique_cls)
+
+for cls_id in unique_cls:
+    cls_idx = np.where(rl == cls_id)[0]
+    n       = min(len(cls_idx), max(1000, per_class))
+    idx_list.append(np.random.choice(cls_idx, n, replace=False))
+
+train_idx = np.concatenate(idx_list)
+np.random.shuffle(train_idx)
+print(f"✅ Training with {len(train_idx):,} points")
+
+total  = len(train_idx)
+chunks = []
+for start in range(0, total, 5000):
+    end = min(start + 5000, total)
+    if start % 25000 == 0:
+        print(f"   Features: {start:,} / {total:,} done...")
+    sl = slice(start, end)
+    chunks.append(compute_features(
+        rx[train_idx[sl]], ry[train_idx[sl]], rz[train_idx[sl]],
+        ri[train_idx[sl]],
+        rhag[train_idx[sl]], rstd[train_idx[sl]],
+        rrange[train_idx[sl]], rmean[train_idx[sl]]
+    ))
+
+X_all     = np.vstack(chunks)
+y_all     = rl[train_idx]
+le        = LabelEncoder()
+y_encoded = le.fit_transform(y_all)
+print(f"✅ Feature matrix shape: {X_all.shape}")
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_all, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 4A: Train XGBoost
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 4A: Training XGBoost model...")
+print("="*60)
+
+xgb_clf = XGBClassifier(
+    n_estimators=500, max_depth=8, learning_rate=0.1,
+    subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
+    gamma=0.1, n_jobs=-1, random_state=42,
+    tree_method='hist', eval_metric='mlogloss', verbosity=0
+)
+xgb_clf.fit(X_train, y_train)
+xgb_pred = xgb_clf.predict(X_test)
+xgb_acc  = accuracy_score(y_test, xgb_pred) * 100
+print(f"✅ XGBoost trained!  Accuracy: {xgb_acc:.2f}%")
+
+# ── XGBoost per-class accuracy ──
+xgb_overall, xgb_kappa, xgb_per_class = print_accuracy_report(
+    y_test, xgb_pred, le, "XGBOOST ACCURACY REPORT")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 4B: Train LightGBM
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 4B: Training LightGBM model...")
+print("="*60)
+
+lgbm_clf = LGBMClassifier(
+    n_estimators=500, max_depth=8, learning_rate=0.1,
+    subsample=0.8, colsample_bytree=0.8, min_child_samples=20,
+    n_jobs=-1, random_state=42, verbosity=-1
+)
+lgbm_clf.fit(X_train, y_train)
+lgbm_pred = lgbm_clf.predict(X_test)
+lgbm_acc  = accuracy_score(y_test, lgbm_pred) * 100
+print(f"✅ LightGBM trained! Accuracy: {lgbm_acc:.2f}%")
+
+# ── LightGBM per-class accuracy ──
+lgbm_overall, lgbm_kappa, lgbm_per_class = print_accuracy_report(
+    y_test, lgbm_pred, le, "LIGHTGBM ACCURACY REPORT")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 4C: Ensemble — Soft Voting
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 4C: Ensemble XGBoost + LightGBM...")
+print("="*60)
+
+xgb_proba      = xgb_clf.predict_proba(X_test)
+lgbm_proba     = lgbm_clf.predict_proba(X_test)
+ensemble_proba = (xgb_proba + lgbm_proba) / 2
+ensemble_pred  = np.argmax(ensemble_proba, axis=1)
+
+# ── Ensemble per-class accuracy ──
+ens_overall, ens_kappa, ens_per_class = print_accuracy_report(
+    y_test, ensemble_pred, le, "🏆 ENSEMBLE ACCURACY REPORT (FINAL)")
+
+# ── Model comparison ──
+print(f"\n{'═'*45}")
+print(f"  MODEL COMPARISON")
+print(f"{'═'*45}")
+print(f"  🤖 XGBoost  Accuracy : {xgb_overall:.2f}%  Kappa: {xgb_kappa:.4f}")
+print(f"  🤖 LightGBM Accuracy : {lgbm_overall:.2f}%  Kappa: {lgbm_kappa:.4f}")
+print(f"  🏆 Ensemble Accuracy : {ens_overall:.2f}%  Kappa: {ens_kappa:.4f}  ← BEST")
+print(f"{'═'*45}")
+
+# ── Save confusion matrix ──
+fig, ax = plt.subplots(figsize=(13, 11))
+present_cls = np.unique(y_test)
+labels = [CLASS_INFO.get(int(le.inverse_transform([c])[0]),{}).get("name", str(c)) for c in present_cls]
+cm     = confusion_matrix(y_test, ensemble_pred, labels=present_cls)
+disp   = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+disp.plot(ax=ax, colorbar=True, xticks_rotation=45, cmap='Blues')
+ax.set_title(f"Ensemble Confusion Matrix — Accuracy: {ens_overall:.2f}%  |  Kappa: {ens_kappa:.4f}",
+             fontsize=12, fontweight='bold')
+plt.tight_layout()
+cm_path = REPORT_DIR + r"\confusion_matrix_ensemble.png"
+plt.savefig(cm_path, dpi=150, bbox_inches='tight')
+plt.close()
+print(f"\n✅ Saved: confusion_matrix_ensemble.png")
+
+# ── Save accuracy bar charts ──
+save_accuracy_chart(
+    xgb_per_class, xgb_overall, xgb_kappa,
+    REPORT_DIR + r"\accuracy_xgboost.png",
+    "XGBoost Per-Class Accuracy"
+)
+save_accuracy_chart(
+    lgbm_per_class, lgbm_overall, lgbm_kappa,
+    REPORT_DIR + r"\accuracy_lightgbm.png",
+    "LightGBM Per-Class Accuracy"
+)
+save_accuracy_chart(
+    ens_per_class, ens_overall, ens_kappa,
+    REPORT_DIR + r"\accuracy_ensemble.png",
+    "Ensemble Per-Class Accuracy (XGBoost + LightGBM)"
+)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 5: Load TARGET file
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 5: Loading TARGET file (input.laz)...")
+print("="*60)
+
+tgt = laspy.read(TARGET_LAZ)
+tx  = np.array(tgt.x)
+ty  = np.array(tgt.y)
+tz  = np.array(tgt.z)
+
+try:
+    ti = np.array(tgt.intensity, dtype=float)
+    ti = (ti - ti.min()) / (ti.max() - ti.min() + 1e-10)
+except:
+    ti = np.zeros(len(tx))
+
+print(f"✅ Loaded: {len(tx):,} points")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 6: Compute HAG for Target
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 6: Computing HAG for target...")
+print("="*60)
+
+thag, tstd, trange, tmean = compute_hag(tx, ty, tz)
+tz_range = tz.max() - tz.min()
+print(f"✅ Z range: {tz_range:.2f} m")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 7: Classify Target with Ensemble
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 7: Classifying target with Ensemble...")
+print("="*60)
+
+all_labels = np.zeros(len(tx), dtype=np.uint8)
+total      = len(tx)
+
+for start in range(0, total, CHUNK_SIZE):
+    end = min(start + CHUNK_SIZE, total)
+    print(f"   Chunk {start:,} → {end:,} of {total:,}...")
+    sl      = slice(start, end)
+    X_chunk = compute_features(
+                tx[sl], ty[sl], tz[sl], ti[sl],
+                thag[sl], tstd[sl], trange[sl], tmean[sl])
+    xgb_p   = xgb_clf.predict_proba(X_chunk)
+    lgbm_p  = lgbm_clf.predict_proba(X_chunk)
+    avg_p   = (xgb_p + lgbm_p) / 2
+    pred_enc = np.argmax(avg_p, axis=1)
+    all_labels[sl] = le.inverse_transform(pred_enc).astype(np.uint8)
+
+print("✅ Classification done!")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 8: Rule-Based Post Processing
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 8: Rule-based post-processing...")
+print("="*60)
+
+building_mask = (
+    (thag > 3.0) & (thag < tz_range * 0.65) &
+    (tstd < 0.5) & (trange > 5.0) & (trange < 15.0) &
+    (~np.isin(all_labels, [14, 19, 21, 22])) &
+    (np.isin(all_labels, [1, 2, 3]))
+)
+all_labels[building_mask] = 5
+print(f"✅ Buildings (5)          : {np.sum(building_mask):,} points")
+
+pylon_mask = (
+    (thag > tz_range * 0.4) & (tstd > 2.5) &
+    (~np.isin(all_labels, [5, 19, 21, 22, 14]))
+)
+all_labels[pylon_mask] = 16
+print(f"✅ Pylons/Poles (16)      : {np.sum(pylon_mask):,} points")
+
+hv_mask = (
+    (thag > tz_range * 0.5) & (tstd > 1.0) & (tstd < 2.5) &
+    (~np.isin(all_labels, [5, 16]))
+)
+all_labels[hv_mask] = 19
+print(f"✅ HV Overhead Lines (19) : {np.sum(hv_mask):,} points")
+
+lv_mask = (
+    (thag > tz_range * 0.2) & (thag < tz_range * 0.5) &
+    (tstd > 0.8) & (tstd < 1.5) &
+    (~np.isin(all_labels, [5, 16, 19]))
+)
+all_labels[lv_mask] = 21
+print(f"✅ LV Overhead Lines (21) : {np.sum(lv_mask):,} points")
+
+bare_mask = (
+    (thag > tz_range * 0.3) & (thag < tz_range * 0.7) &
+    (tstd > 0.5) & (tstd < 1.0) &
+    (~np.isin(all_labels, [5, 16, 19, 21]))
+)
+all_labels[bare_mask] = 14
+print(f"✅ Bare Conductors (14)   : {np.sum(bare_mask):,} points")
+
+otherpole_mask = (
+    (thag > 2.0) & (thag < tz_range * 0.4) & (tstd > 1.5) &
+    (~np.isin(all_labels, [5, 16, 19, 21, 14]))
+)
+all_labels[otherpole_mask] = 17
+print(f"✅ Other Poles (17)       : {np.sum(otherpole_mask):,} points")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 9: OUTPUT FILE ACCURACY REPORT
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 9: OUTPUT FILE — Class Distribution & Accuracy")
+print("="*60)
+
+print(f"\n{'═'*65}")
+print(f"  OUTPUT FILE CLASSIFICATION RESULTS")
+print(f"{'═'*65}")
+print(f"  {'Class':>6} {'Name':<25} {'Points':>12} {'%':>7} {'Color':>20}")
+print(f"{'─'*65}")
+
+output_class_counts = {}
+for cls_id in sorted(CLASS_INFO.keys()):
+    count = int(np.sum(all_labels == cls_id))
+    if count == 0:
+        continue
+    pct  = 100 * count / total
+    name = CLASS_INFO[cls_id]["name"]
+    r, g, b = CLASS_INFO[cls_id]["rgb"]
+    output_class_counts[name] = count
+    print(f"  {cls_id:>6} {name:<25} {count:>12,} {pct:>6.1f}%   RGB({r:>3},{g:>3},{b:>3})")
+
+print(f"{'─'*65}")
+print(f"  {'TOTAL POINTS':<32} {total:>12,} {'100.0%':>7}")
+print(f"{'═'*65}")
+
+# ── Overall accuracy from training test split ──
+print(f"\n{'═'*65}")
+print(f"  FINAL MODEL ACCURACY SUMMARY")
+print(f"{'═'*65}")
+print(f"  🤖 XGBoost  Overall Accuracy : {xgb_overall:.2f}%")
+print(f"  🤖 LightGBM Overall Accuracy : {lgbm_overall:.2f}%")
+print(f"  🏆 Ensemble Overall Accuracy : {ens_overall:.2f}%  ← USED FOR OUTPUT")
+print(f"  🎯 Ensemble Kappa Score      : {ens_kappa:.4f}  ", end="")
+if   ens_kappa > 0.80: print("(Excellent ✅)")
+elif ens_kappa > 0.60: print("(Good ✅)")
+elif ens_kappa > 0.40: print("(Moderate ⚠️)")
+else:                  print("(Needs Improvement ❌)")
+
+print(f"\n  PER CLASS ACCURACY (from training validation):")
+print(f"{'─'*55}")
+for cls_enc in np.unique(y_test):
+    cls_id = int(le.inverse_transform([cls_enc])[0])
+    name   = CLASS_INFO.get(cls_id, {}).get("name", f"Class {cls_id}")
+    mask   = y_test == cls_enc
+    acc    = accuracy_score(y_test[mask], ensemble_pred[mask]) * 100
+    status = "✅" if acc >= 90 else "⚠️ " if acc >= 70 else "❌"
+    bar    = "█" * int(acc/5) + "░" * (20-int(acc/5))
+    print(f"  {cls_id:>3} {name:<25} {acc:>7.1f}% {status}")
+    print(f"       [{bar}]")
+print(f"{'─'*55}")
+print(f"  {'🏆 OVERALL':<28} {ens_overall:>7.2f}% ✅")
+print(f"{'═'*65}")
+
+# ── Save output distribution chart ──
+fig3, ax3 = plt.subplots(figsize=(14, 7))
+names_out  = list(output_class_counts.keys())
+counts_out = list(output_class_counts.values())
+bar_colors = []
+for name in names_out:
+    cls_id = next((k for k, v in CLASS_INFO.items() if v["name"] == name), 0)
+    r, g, b = CLASS_INFO[cls_id]["rgb"]
+    bar_colors.append((r/255, g/255, b/255))
+
+bars3 = ax3.bar(names_out, counts_out, color=bar_colors, edgecolor='black', linewidth=0.5)
+for bar, count in zip(bars3, counts_out):
+    pct = 100 * count / total
+    ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + total*0.002,
+             f'{count:,}\n({pct:.1f}%)', ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+ax3.set_xlabel("Class", fontsize=12)
+ax3.set_ylabel("Point Count", fontsize=12)
+ax3.set_title(f"Output File — Points Per Class\nEnsemble Accuracy: {ens_overall:.2f}%  |  Kappa: {ens_kappa:.4f}",
+              fontsize=13, fontweight='bold')
+ax3.tick_params(axis='x', rotation=35)
+plt.tight_layout()
+dist_path = REPORT_DIR + r"\output_class_distribution.png"
+plt.savefig(dist_path, dpi=150, bbox_inches='tight')
+plt.close()
+print(f"\n✅ Saved: output_class_distribution.png")
+
+# ── Save ensemble accuracy bar chart for output ──
+save_accuracy_chart(
+    ens_per_class, ens_overall, ens_kappa,
+    REPORT_DIR + r"\output_accuracy_report.png",
+    "Output File — Ensemble Per-Class Accuracy"
+)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 10: Write RGB Colors + Save LAZ
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 10: Writing RGB colors and saving LAZ...")
+print("="*60)
+
+red   = np.zeros(len(tx), dtype=np.uint16)
+green = np.zeros(len(tx), dtype=np.uint16)
+blue  = np.zeros(len(tx), dtype=np.uint16)
+
+for cls_id, info in CLASS_INFO.items():
+    mask = all_labels == cls_id
+    if np.any(mask):
+        r, g, b     = info["rgb"]
+        red[mask]   = r * 256
+        green[mask] = g * 256
+        blue[mask]  = b * 256
+        print(f"   ✅ Class {cls_id:>2} {info['name']:<25} → RGB({r:>3},{g:>3},{b:>3}) → {np.sum(mask):>10,} pts")
+
+header         = laspy.LasHeader(point_format=2, version="1.2")
+header.offsets = tgt.header.offsets
+header.scales  = tgt.header.scales
+new_las                = laspy.LasData(header=header)
+new_las.x              = tgt.x
+new_las.y              = tgt.y
+new_las.z              = tgt.z
+new_las.classification = all_labels
+new_las.red            = red
+new_las.green          = green
+new_las.blue           = blue
+try:
+    new_las.intensity = tgt.intensity
+except:
+    pass
+new_las.write(OUTPUT_LAZ)
+
+# ══════════════════════════════════════════════════════════════
+# FINAL SUMMARY
+# ══════════════════════════════════════════════════════════════
+print(f"""
+╔══════════════════════════════════════════════════════════════╗
+║         ✅ ENSEMBLE CLASSIFICATION COMPLETE!                 ║
+╠══════════════════════════════════════════════════════════════╣
+║  📁 Output   : OUTPUT_CLASSIFIED.laz                         ║
+║  🤖 XGBoost  Accuracy : {xgb_overall:.2f}%                           ║
+║  🤖 LightGBM Accuracy : {lgbm_overall:.2f}%                           ║
+║  🏆 Ensemble Accuracy : {ens_overall:.2f}%  ← BEST                  ║
+║  🎯 Kappa Score       : {ens_kappa:.4f}                          ║
+╠══════════════════════════════════════════════════════════════╣
+║  FILES SAVED:                                                ║
+║  📊 confusion_matrix_ensemble.png                            ║
+║  📊 accuracy_xgboost.png                                     ║
+║  📊 accuracy_lightgbm.png                                    ║
+║  📊 accuracy_ensemble.png                                    ║
+║  📊 output_class_distribution.png                            ║
+║  📊 output_accuracy_report.png                               ║
+╠══════════════════════════════════════════════════════════════╣
+║  CLASS COLORS:                                               ║
+║  Class  0  ⬛ Default/Unclassified  = Dark Gray             ║
+║  Class  1  🟤 Ground               = Brown                  ║
+║  Class  2  🟩 Low Vegetation        = Light Green            ║
+║  Class  3  🟢 Medium Vegetation     = Medium Green           ║
+║  Class  4  🌲 High Vegetation       = Dark Green             ║
+║  Class  5  🟠 Buildings             = Orange                 ║
+║  Class 12  🩶 Street               = Silver Gray            ║
+║  Class 14  🔴 Bare Conductor        = Red                    ║
+║  Class 16  🟡 Pylons/Poles          = Yellow                 ║
+║  Class 17  🟣 Other Poles           = Purple                 ║
+║  Class 19  🔵 HV Overhead Lines     = Blue                   ║
+║  Class 21  🩵 LV Overhead Lines     = Cyan                   ║
+║  Class 22  🩷 Other Lines           = Deep Pink              ║
+╠══════════════════════════════════════════════════════════════╣
+║  📂 Open in CloudCompare:                                    ║
+║  1. File → Open → OUTPUT_CLASSIFIED.laz                      ║
+║  2. Left panel → click your point cloud                      ║
+║  3. Properties → Colors → RGB                                ║
+╚══════════════════════════════════════════════════════════════╝
+""")
+print("✅ DONE!")

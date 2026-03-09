@@ -1,0 +1,487 @@
+import numpy as np
+import pandas as pd
+import laspy
+from sklearn.neighbors import NearestNeighbors
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.preprocessing import LabelEncoder
+from xgboost import XGBClassifier
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+
+# ══════════════════════════════════════════════════════════════
+# ✅ FILE PATHS — CHANGE THESE TO YOUR PATHS
+# ══════════════════════════════════════════════════════════════
+REFERENCE_LAZ = r"D:\veera\VK.laz"                    # ← your manually classified reference file
+TARGET_LAZ    = r"D:\veera\DX3035724 S.GIUSTO000001.laz"                  # ← your unclassified input file
+OUTPUT_LAZ    = r"D:\veera\OUTPUT_CLASSIFIED2222222.laz"       # ← classified output saved here
+
+# ══════════════════════════════════════════════════════════════
+# ✅ SETTINGS
+# ══════════════════════════════════════════════════════════════
+GRID_RES     = 0.5      # Grid resolution in meters for HAG
+TRAIN_POINTS = 500000   # Total training points (stra    tified per class)
+CHUNK_SIZE   = 300000   # Points per chunk during inference
+K_NEIGHBORS  = 20       # KNN neighbors for feature extraction
+
+# ══════════════════════════════════════════════════════════════
+# ✅ YOUR CUSTOM CLASS SYSTEM — 13 CLASSES
+# ══════════════════════════════════════════════════════════════
+VALID_CLASSES = [0, 1, 2, 3, 4, 5, 12, 14, 16, 17, 19, 21, 22]
+
+CLASS_INFO = {
+    0:  {"name": "Default/Unclassified", "rgb": (0,   0,   0)},   # ⬛ Black
+    1:  {"name": "Ground",               "rgb": (139, 90,  43)},  # 🟤 Brown
+    2:  {"name": "Low Vegetation",       "rgb": (200, 200, 200)}, # ⬜ Light Gray
+    3:  {"name": "Medium Vegetation",    "rgb": (34,  139, 34)},  # 🟢 Medium Green
+    4:  {"name": "High Vegetation",      "rgb": (0,   100, 0)},   # 🌲 Dark Green
+    5:  {"name": "Buildings",            "rgb": (255, 140, 0)},   # 🟠 Orange
+    12: {"name": "Street",               "rgb": (80,  80,  80)},  # 🩶 Dark Gray
+    14: {"name": "Bare Conductor",       "rgb": (255, 0,   0)},   # 🔴 Red
+    16: {"name": "Pylons/Poles",         "rgb": (255, 255, 0)},   # 🟡 Yellow
+    17: {"name": "Other Poles",          "rgb": (128, 0,   128)}, # 🟣 Purple
+    19: {"name": "HV Overhead Lines",    "rgb": (0,   0,   255)}, # 🔵 Blue
+    21: {"name": "LV Overhead Lines",    "rgb": (0,   255, 255)}, # 🩵 Cyan
+    22: {"name": "Other Lines",          "rgb": (255, 105, 180)}, # 🩷 Pink
+}
+
+FEAT_NAMES = ['Linearity','Planarity','Sphericity','Omnivar','Anisotropy',
+              'Eigentropy','Curvature','Verticality','HeightVar','HeightIQR',
+              'MeanDist','MaxDist','Density','Height','HAG',
+              'Intensity','LocalSTD','LocalRange','LocalMean']
+
+# ══════════════════════════════════════════════════════════════
+# HELPER: Height Above Ground (HAG)
+# ══════════════════════════════════════════════════════════════
+def compute_hag(x, y, z):
+    print("      → Computing Height Above Ground...")
+    x_idx = ((x - x.min()) / GRID_RES).astype(int)
+    y_idx = ((y - y.min()) / GRID_RES).astype(int)
+    gkey  = x_idx * 100000 + y_idx
+    df          = pd.DataFrame({'z': z, 'key': gkey})
+    gmin        = df.groupby('key')['z'].min()
+    gstd        = df.groupby('key')['z'].std().fillna(0)
+    gmax        = df.groupby('key')['z'].max()
+    gmean       = df.groupby('key')['z'].mean()
+    df['zg']    = df['key'].map(gmin)
+    df['zs']    = df['key'].map(gstd)
+    df['zmax']  = df['key'].map(gmax)
+    df['zmean'] = df['key'].map(gmean)
+    hag    = np.array(df['z']    - df['zg'])
+    lstd   = np.array(df['zs'])
+    lrange = np.array(df['zmax'] - df['zg'])
+    lmean  = np.array(df['zmean'])
+    print("      → HAG Done!")
+    return hag, lstd, lrange, lmean
+
+# ══════════════════════════════════════════════════════════════
+# HELPER: 19 Geometric Features
+# ══════════════════════════════════════════════════════════════
+def compute_features(x, y, z, intensity, hag, lstd, lrange, lmean):
+    coords    = np.column_stack([x, y, z])
+    nbrs      = NearestNeighbors(n_neighbors=K_NEIGHBORS, algorithm='kd_tree', n_jobs=-1).fit(coords)
+    dist, idx = nbrs.kneighbors(coords)
+    feats = []
+    for i in range(len(coords)):
+        nb  = coords[idx[i]]
+        cov = np.cov((nb - nb.mean(axis=0)).T)
+        ev  = np.sort(np.abs(np.linalg.eigvalsh(cov)))[::-1] + 1e-10
+        e1, e2, e3 = ev
+        feats.append([
+            (e1-e2)/e1,
+            (e2-e3)/e1,
+            e3/e1,
+            (e1*e2*e3)**(1/3),
+            (e1-e3)/e1,
+            -(e1*np.log(e1)+e2*np.log(e2)+e3*np.log(e3)),
+            e3/(e1+e2+e3),
+            1-(e3/e1),
+            np.var(nb[:,2]),
+            np.percentile(nb[:,2],75)-np.percentile(nb[:,2],25),
+            dist[i].mean(),
+            dist[i].max(),
+            K_NEIGHBORS/(dist[i].mean()**2+1e-10),
+            z[i],
+            hag[i],
+            intensity[i],
+            lstd[i],
+            lrange[i],
+            lmean[i],
+        ])
+    return np.array(feats)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 1: Load REFERENCE file
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 1: Loading REFERENCE file...")
+print("="*60)
+
+ref = laspy.read(REFERENCE_LAZ)
+rx  = np.array(ref.x)
+ry  = np.array(ref.y)
+rz  = np.array(ref.z)
+rl  = np.array(ref.classification)
+
+try:
+    ri = np.array(ref.intensity, dtype=float)
+    ri = (ri - ri.min()) / (ri.max() - ri.min() + 1e-10)
+except:
+    ri = np.zeros(len(rx))
+
+print(f"✅ Loaded: {len(rx):,} points")
+
+vmask = np.isin(rl, VALID_CLASSES)
+rx, ry, rz, ri, rl = rx[vmask], ry[vmask], rz[vmask], ri[vmask], rl[vmask]
+print(f"✅ Valid points: {len(rx):,}")
+
+print(f"\n{'─'*55}")
+print(f"  {'Class':>6} {'Name':<25} {'Count':>10} {'%':>7}")
+print(f"{'─'*55}")
+for c in np.unique(rl):
+    count = np.sum(rl == c)
+    name  = CLASS_INFO.get(int(c), {}).get("name", str(c))
+    print(f"  {int(c):>6} {name:<25} {count:>10,} {100*count/len(rl):>6.1f}%")
+print(f"{'─'*55}")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 2: Compute HAG for Reference
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 2: Computing HAG for reference...")
+print("="*60)
+rhag, rstd, rrange, rmean = compute_hag(rx, ry, rz)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 3: Stratified Subsample + Feature Extraction
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 3: Computing training features (3-5 mins)...")
+print("="*60)
+
+unique_cls = np.unique(rl)
+idx_list   = []
+per_class  = TRAIN_POINTS // len(unique_cls)
+
+for cls_id in unique_cls:
+    cls_idx = np.where(rl == cls_id)[0]
+    n       = min(len(cls_idx), max(1000, per_class))
+    idx_list.append(np.random.choice(cls_idx, n, replace=False))
+
+train_idx = np.concatenate(idx_list)
+np.random.shuffle(train_idx)
+print(f"✅ Training with {len(train_idx):,} points")
+
+total  = len(train_idx)
+chunks = []
+for start in range(0, total, 5000):
+    end = min(start + 5000, total)
+    if start % 25000 == 0:
+        print(f"   Features: {start:,} / {total:,} done...")
+    sl = slice(start, end)
+    chunks.append(compute_features(
+        rx[train_idx[sl]], ry[train_idx[sl]], rz[train_idx[sl]],
+        ri[train_idx[sl]],
+        rhag[train_idx[sl]], rstd[train_idx[sl]],
+        rrange[train_idx[sl]], rmean[train_idx[sl]]
+    ))
+
+X_all     = np.vstack(chunks)
+y_all     = rl[train_idx]
+le        = LabelEncoder()
+y_encoded = le.fit_transform(y_all)
+print(f"✅ Feature matrix: {X_all.shape}")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 4: Train XGBoost Model
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 4: Training XGBoost model...")
+print("="*60)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_all, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded)
+
+clf = XGBClassifier(
+    n_estimators=500,
+    max_depth=8,
+    learning_rate=0.1,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    min_child_weight=5,
+    gamma=0.1,
+    n_jobs=-1,
+    random_state=42,
+    tree_method='hist',
+    eval_metric='mlogloss',
+    verbosity=0
+)
+clf.fit(X_train, y_train)
+print("✅ XGBoost trained!")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 5: Accuracy Report
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 5: Accuracy Report...")
+print("="*60)
+
+y_pred      = clf.predict(X_test)
+overall_acc = accuracy_score(y_test, y_pred) * 100
+cv_scores   = cross_val_score(clf, X_all, y_encoded, cv=5, scoring='accuracy', n_jobs=-1)
+
+print(f"\n🎯 Overall Accuracy  : {overall_acc:.1f}%")
+print(f"🎯 Cross-Val Accuracy: {cv_scores.mean()*100:.1f}% (±{cv_scores.std()*100:.1f}%)")
+
+report      = classification_report(y_test, y_pred, output_dict=True)
+present_cls = np.unique(y_test)
+
+print(f"\n{'─'*70}")
+print(f"{'Cls':>4} {'Name':<25} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Acc':>8}")
+print(f"{'─'*70}")
+
+for cls_enc in present_cls:
+    cls_id = int(le.inverse_transform([cls_enc])[0])
+    name   = CLASS_INFO.get(cls_id, {}).get("name", f"Class {cls_id}")
+    key    = str(cls_enc)
+    mask   = y_test == cls_enc
+    acc    = accuracy_score(y_test[mask], y_pred[mask]) * 100
+    if key in report:
+        prec = report[key]['precision'] * 100
+        rec  = report[key]['recall']    * 100
+        f1   = report[key]['f1-score']  * 100
+    else:
+        prec = rec = f1 = 0.0
+    bar = "█" * int(acc/5) + "░" * (20-int(acc/5))
+    print(f"  {cls_id:>3} {name:<25} {prec:>9.1f}% {rec:>7.1f}% {f1:>7.1f}% {acc:>7.1f}%")
+    print(f"       [{bar}] {acc:.1f}%")
+
+print(f"{'─'*70}")
+print(f"  {'OVERALL':<29} {'':>10} {'':>8} {'':>8} {overall_acc:>7.1f}%")
+print(f"{'─'*70}")
+
+# Save confusion matrix
+fig, ax = plt.subplots(figsize=(12, 10))
+labels  = [CLASS_INFO.get(int(le.inverse_transform([c])[0]),{}).get("name", str(c)) for c in present_cls]
+cm      = confusion_matrix(y_test, y_pred, labels=present_cls)
+disp    = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+disp.plot(ax=ax, colorbar=True, xticks_rotation=45, cmap='Blues')
+ax.set_title(f"Confusion Matrix — Accuracy: {overall_acc:.1f}%", fontsize=13, fontweight='bold')
+plt.tight_layout()
+plt.savefig(r"D:\veera\confusion_matrix.png", dpi=150, bbox_inches='tight')
+plt.close()
+print(f"\n✅ Saved: confusion_matrix.png")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 6: Load TARGET file
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 6: Loading TARGET (input) file...")
+print("="*60)
+
+tgt = laspy.read(TARGET_LAZ)
+tx  = np.array(tgt.x)
+ty  = np.array(tgt.y)
+tz  = np.array(tgt.z)
+
+try:
+    ti = np.array(tgt.intensity, dtype=float)
+    ti = (ti - ti.min()) / (ti.max() - ti.min() + 1e-10)
+except:
+    ti = np.zeros(len(tx))
+
+print(f"✅ Loaded: {len(tx):,} points")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 7: Compute HAG for Target
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 7: Computing HAG for target...")
+print("="*60)
+
+thag, tstd, trange, tmean = compute_hag(tx, ty, tz)
+tz_range = tz.max() - tz.min()
+print(f"✅ Z range of target: {tz_range:.2f} m")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 8: Classify Target in Chunks
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 8: Classifying target file in chunks...")
+print("="*60)
+
+all_labels = np.zeros(len(tx), dtype=np.uint8)
+total      = len(tx)
+
+for start in range(0, total, CHUNK_SIZE):
+    end = min(start + CHUNK_SIZE, total)
+    print(f"   Chunk {start:,} → {end:,} of {total:,}...")
+    sl             = slice(start, end)
+    X_chunk        = compute_features(
+                        tx[sl], ty[sl], tz[sl], ti[sl],
+                        thag[sl], tstd[sl], trange[sl], tmean[sl])
+    pred_enc       = clf.predict(X_chunk)
+    all_labels[sl] = le.inverse_transform(pred_enc).astype(np.uint8)
+
+print("✅ Classification done!")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 9: Rule-Based Post Processing (FIXED)
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 9: Rule-based post-processing...")
+print("="*60)
+
+# ── Buildings (Class 5) — TIGHTENED to avoid bridge/road mistakes ──
+building_mask = (
+    (thag > 3.0) &
+    (thag < tz_range * 0.65) &
+    (tstd < 0.5) &                              # tightened from 1.2
+    (trange > 5.0) &                            # raised from 2.0
+    (trange < 15.0) &                           # new upper cap
+    (~np.isin(all_labels, [19, 21, 22, 14])) &
+    (np.isin(all_labels, [1, 2, 3]))
+)
+all_labels[building_mask] = 5
+print(f"✅ Buildings (5)          : {np.sum(building_mask):,} points")
+
+# ── Pylons/Poles (Class 16) ──
+pylon_mask = (
+    (thag > tz_range * 0.4) &
+    (tstd > 2.5) &
+    (~np.isin(all_labels, [5, 19, 21, 22]))
+)
+all_labels[pylon_mask] = 16
+print(f"✅ Pylons/Poles (16)      : {np.sum(pylon_mask):,} points")
+
+# ── HV Overhead Lines (Class 19) ──
+hv_mask = (
+    (thag > tz_range * 0.5) &
+    (tstd > 1.0) &
+    (tstd < 2.5) &
+    (~np.isin(all_labels, [5, 16]))
+)
+all_labels[hv_mask] = 19
+print(f"✅ HV Overhead Lines (19) : {np.sum(hv_mask):,} points")
+
+# ── LV Overhead Lines (Class 21) ──
+lv_mask = (
+    (thag > tz_range * 0.2) &
+    (thag < tz_range * 0.5) &
+    (tstd > 0.8) &
+    (tstd < 1.5) &
+    (~np.isin(all_labels, [5, 16, 19]))
+)
+all_labels[lv_mask] = 21
+print(f"✅ LV Overhead Lines (21) : {np.sum(lv_mask):,} points")
+
+# ── Bare Conductor (Class 14) ──
+bare_mask = (
+    (thag > tz_range * 0.3) &
+    (thag < tz_range * 0.7) &
+    (tstd > 0.5) &
+    (tstd < 1.0) &
+    (~np.isin(all_labels, [5, 16, 19, 21]))
+)
+all_labels[bare_mask] = 14
+print(f"✅ Bare Conductors (14)   : {np.sum(bare_mask):,} points")
+
+# ── Other Poles (Class 17) — street lamps etc ──
+otherpole_mask = (
+    (thag > 2.0) &
+    (thag < tz_range * 0.4) &
+    (tstd > 1.5) &
+    (~np.isin(all_labels, [5, 16, 19, 21, 14]))
+)
+all_labels[otherpole_mask] = 17
+print(f"✅ Other Poles (17)       : {np.sum(otherpole_mask):,} points")
+
+# ── Final Distribution ──
+print(f"\n📊 Final Results ({total:,} total points):")
+print(f"{'─'*55}")
+print(f"  {'Class':>6} {'Name':<25} {'Count':>10} {'%':>7}")
+print(f"{'─'*55}")
+for cls_id in sorted(CLASS_INFO.keys()):
+    count = int(np.sum(all_labels == cls_id))
+    if count == 0:
+        continue
+    pct  = 100 * count / total
+    name = CLASS_INFO[cls_id]["name"]
+    print(f"  {cls_id:>6} {name:<25} {count:>10,} {pct:>6.1f}%")
+print(f"{'─'*55}")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 10: Write RGB Colors + Save LAZ
+# ══════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("STEP 10: Writing RGB colors and saving LAZ...")
+print("="*60)
+
+red   = np.zeros(len(tx), dtype=np.uint16)
+green = np.zeros(len(tx), dtype=np.uint16)
+blue  = np.zeros(len(tx), dtype=np.uint16)
+
+for cls_id, info in CLASS_INFO.items():
+    mask = all_labels == cls_id
+    if np.any(mask):
+        r, g, b     = info["rgb"]
+        red[mask]   = r * 256
+        green[mask] = g * 256
+        blue[mask]  = b * 256
+        print(f"   ✅ Class {cls_id:>2} {info['name']:<25} → RGB({r:>3},{g:>3},{b:>3}) → {np.sum(mask):>10,} pts")
+
+header         = laspy.LasHeader(point_format=2, version="1.2")
+header.offsets = tgt.header.offsets
+header.scales  = tgt.header.scales
+
+new_las                = laspy.LasData(header=header)
+new_las.x              = tgt.x
+new_las.y              = tgt.y
+new_las.z              = tgt.z
+new_las.classification = all_labels
+new_las.red            = red
+new_las.green          = green
+new_las.blue           = blue
+
+try:
+    new_las.intensity = tgt.intensity
+except:
+    pass
+
+new_las.write(OUTPUT_LAZ)
+
+# ══════════════════════════════════════════════════════════════
+# FINAL SUMMARY
+# ══════════════════════════════════════════════════════════════
+print(f"""
+╔══════════════════════════════════════════════════════════════╗
+║              ✅ CLASSIFICATION COMPLETE!                     ║
+╠══════════════════════════════════════════════════════════════╣
+║  📁 Output  : OUTPUT_CLASSIFIED.laz                          ║
+║  📊 Accuracy: {overall_acc:.1f}%                                      ║
+╠══════════════════════════════════════════════════════════════╣
+║  CLASS COLORS:                                               ║
+║  Class  0  ⬛ Default/Unclassified  = Black                 ║
+║  Class  1  🟤 Ground               = Brown                  ║
+║  Class  2  ⬜ Low Vegetation        = Light Gray             ║
+║  Class  3  🟢 Medium Vegetation     = Medium Green           ║
+║  Class  4  🌲 High Vegetation       = Dark Green             ║
+║  Class  5  🟠 Buildings             = Orange                 ║
+║  Class 12  🩶 Street               = Dark Gray              ║
+║  Class 14  🔴 Bare Conductor        = Red                    ║
+║  Class 16  🟡 Pylons/Poles          = Yellow                 ║
+║  Class 17  🟣 Other Poles           = Purple                 ║
+║  Class 19  🔵 HV Overhead Lines     = Blue                   ║
+║  Class 21  🩵 LV Overhead Lines     = Cyan                   ║
+║  Class 22  🩷 Other Lines           = Pink                   ║
+╠══════════════════════════════════════════════════════════════╣
+║  📂 Open in CloudCompare:                                    ║
+║  1. File → Open → OUTPUT_CLASSIFIED.laz                      ║
+║  2. Left panel → click your point cloud                      ║
+║  3. Properties → Colors → RGB                                ║
+╚══════════════════════════════════════════════════════════════╝
+""")
+print("✅ DONE!")
